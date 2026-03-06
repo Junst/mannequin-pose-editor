@@ -455,9 +455,11 @@ function captureNormalMap() {
     link.click();
 }
 
-// ── Auto Pose from Image (MediaPipe) ────────────────────────────────────────
+// ── Auto Pose from Image (ViTPose via Transformers.js) ──────────────────────
 
-let poseLandmarker = null;
+let vitposeModel = null;
+let vitposeProcessor = null;
+let transformersLib = null;
 
 async function handlePoseImageUpload() {
     document.getElementById('pose-image-input').click();
@@ -469,70 +471,97 @@ async function processPoseImage(event) {
 
     const statusEl = document.getElementById('pose-detect-status');
 
-    // Lazy-init detector (heavy model for best accuracy)
-    if (!poseLandmarker) {
-        statusEl.textContent = 'Loading AI model (heavy)...';
+    // Lazy-init ViTPose model
+    if (!vitposeModel) {
+        statusEl.textContent = 'Loading ViTPose model (first time ~90MB)...';
         try {
-            const { PoseLandmarker, FilesetResolver } = await import(
-                "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs"
+            transformersLib = await import(
+                "https://cdn.jsdelivr.net/npm/@huggingface/transformers@3"
             );
-            const resolver = await FilesetResolver.forVisionTasks(
-                "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
-            );
-            poseLandmarker = await PoseLandmarker.createFromOptions(resolver, {
-                baseOptions: {
-                    modelAssetPath: "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_heavy/float16/latest/pose_landmarker_heavy.task",
-                    delegate: "GPU",
-                },
-                runningMode: "IMAGE",
-                numPoses: 1,
+            const { AutoModel, AutoImageProcessor, env } = transformersLib;
+
+            // Allow loading from CDN without local cache issues
+            env.allowLocalModels = false;
+
+            const model_id = 'onnx-community/vitpose-base-simple';
+
+            statusEl.textContent = 'Downloading ViTPose model...';
+            vitposeProcessor = await AutoImageProcessor.from_pretrained(model_id);
+            vitposeModel = await AutoModel.from_pretrained(model_id, {
+                dtype: 'q8',  // quantized ~90MB instead of ~344MB
             });
+            statusEl.textContent = 'Model loaded!';
         } catch (err) {
-            console.error("MediaPipe load failed:", err);
+            console.error("ViTPose load failed:", err);
             statusEl.textContent = 'Model load failed';
-            alert('Failed to load pose detection model.\n' + err.message);
+            alert('Failed to load ViTPose model.\n' + err.message);
             return;
         }
     }
 
     statusEl.textContent = 'Detecting pose...';
 
+    const blobUrl = URL.createObjectURL(file);
     const img = new Image();
-    img.src = URL.createObjectURL(file);
+    img.src = blobUrl;
     await new Promise((res, rej) => { img.onload = res; img.onerror = rej; });
 
-    const result = poseLandmarker.detect(img);
-    URL.revokeObjectURL(img.src);
+    try {
+        const { RawImage } = transformersLib;
 
-    if (!result.landmarks || result.landmarks.length === 0) {
-        statusEl.textContent = 'No pose detected';
-        return;
+        // Read image for ViTPose
+        const rawImage = await RawImage.read(blobUrl);
+
+        const inputs = await vitposeProcessor(rawImage);
+        const { heatmaps } = await vitposeModel(inputs);
+
+        // Full image as bounding box [x, y, width, height]
+        const boxes = [[[0, 0, rawImage.width, rawImage.height]]];
+        const results = vitposeProcessor.post_process_pose_estimation(heatmaps, boxes);
+
+        if (!results || !results[0] || results[0].length === 0) {
+            statusEl.textContent = 'No pose detected';
+            URL.revokeObjectURL(blobUrl);
+            return;
+        }
+
+        const keypoints = results[0][0].keypoints;
+
+        // Normalize to 0-1 range
+        const normalized = keypoints.map(kp => ({
+            x: kp.x / rawImage.width,
+            y: kp.y / rawImage.height,
+            score: kp.score,
+        }));
+
+        // Draw debug skeleton
+        drawPoseDebug(img, normalized);
+
+        // Reset and apply
+        resetPose();
+        const pose = cocoToMannequinPose(normalized);
+        applyPoseToMannequin(pose);
+
+        if (selectedPartName) buildSliders(selectedPartName);
+        statusEl.textContent = 'Pose applied! (ViTPose)';
+    } catch (err) {
+        console.error("ViTPose inference failed:", err);
+        statusEl.textContent = 'Detection failed: ' + err.message;
     }
 
-    // Draw debug skeleton overlay on viewport
-    drawPoseDebug(img, result.landmarks[0]);
-
-    // Reset pose first so previous pose doesn't interfere
-    resetPose();
-
-    // Use 2D normalized landmarks (reliable) + 3D world landmarks (for depth hints)
-    const pose = landmarksToMannequinPose(result.landmarks[0], result.worldLandmarks[0]);
-    applyPoseToMannequin(pose);
-
-    if (selectedPartName) buildSliders(selectedPartName);
-    statusEl.textContent = 'Pose applied! (see skeleton overlay)';
+    URL.revokeObjectURL(blobUrl);
     event.target.value = '';
 }
 
-// Skeleton connections for debug drawing
+// COCO 17 skeleton connections for debug drawing
 const POSE_CONNECTIONS = [
-    [11,13],[13,15],[12,14],[14,16],  // arms
-    [11,12],[11,23],[12,24],[23,24],  // torso
-    [23,25],[25,27],[24,26],[26,28],  // legs
-    [0,7],[0,8],[7,8],               // head
+    [0,1],[0,2],[1,3],[2,4],          // head
+    [5,6],[5,7],[7,9],[6,8],[8,10],   // arms
+    [5,11],[6,12],[11,12],            // torso
+    [11,13],[13,15],[12,14],[14,16],  // legs
 ];
 
-function drawPoseDebug(img, landmarks) {
+function drawPoseDebug(img, kp) {
     let debugCanvas = document.getElementById('pose-debug');
     if (!debugCanvas) {
         debugCanvas = document.createElement('canvas');
@@ -553,107 +582,110 @@ function drawPoseDebug(img, landmarks) {
     ctx.strokeStyle = '#00ff00';
     ctx.lineWidth = Math.max(2, w * 0.005);
     for (const [a, b] of POSE_CONNECTIONS) {
-        const la = landmarks[a], lb = landmarks[b];
-        if (la.visibility < 0.3 || lb.visibility < 0.3) continue;
+        if (kp[a].score < 0.3 || kp[b].score < 0.3) continue;
         ctx.beginPath();
-        ctx.moveTo(la.x * w, la.y * h);
-        ctx.lineTo(lb.x * w, lb.y * h);
+        ctx.moveTo(kp[a].x * w, kp[a].y * h);
+        ctx.lineTo(kp[b].x * w, kp[b].y * h);
         ctx.stroke();
     }
 
     // Draw joints
     const r = Math.max(3, w * 0.008);
-    for (let i = 0; i < 33; i++) {
-        const lm = landmarks[i];
-        if (lm.visibility < 0.3) continue;
-        ctx.fillStyle = lm.visibility > 0.7 ? '#ff0000' : '#ffaa00';
+    for (let i = 0; i < kp.length; i++) {
+        if (kp[i].score < 0.3) continue;
+        ctx.fillStyle = kp[i].score > 0.7 ? '#ff0000' : '#ffaa00';
         ctx.beginPath();
-        ctx.arc(lm.x * w, lm.y * h, r, 0, Math.PI * 2);
+        ctx.arc(kp[i].x * w, kp[i].y * h, r, 0, Math.PI * 2);
         ctx.fill();
     }
 }
 
-function landmarksToMannequinPose(nl, wl) {
-    // nl = normalized landmarks (2D image space, reliable)
-    //   x = left→right in image (0..1), y = top→bottom (0..1)
-    // wl = world landmarks (3D, z is noisy)
-    //   x = person's left, y = down, z = toward camera
+function cocoToMannequinPose(kp) {
+    // COCO 17 keypoints (all 2D normalized 0-1):
+    // 0:nose 1:l_eye 2:r_eye 3:l_ear 4:r_ear
+    // 5:l_shoulder 6:r_shoulder 7:l_elbow 8:r_elbow
+    // 9:l_wrist 10:r_wrist 11:l_hip 12:r_hip
+    // 13:l_knee 14:r_knee 15:l_ankle 16:r_ankle
 
     const DEG = 180 / Math.PI;
     const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
 
-    // 2D direction from landmark a to b
-    const d2 = (a, b) => [nl[b].x - nl[a].x, nl[b].y - nl[a].y];
+    // 2D direction from keypoint a to b
+    const d2 = (a, b) => [kp[b].x - kp[a].x, kp[b].y - kp[a].y];
+    const len2 = (d) => Math.sqrt(d[0]**2 + d[1]**2);
+    const dot2 = (a, b) => a[0]*b[0] + a[1]*b[1];
 
-    // 3D direction from landmark a to b
-    const d3 = (a, b) => [wl[b].x - wl[a].x, wl[b].y - wl[a].y, wl[b].z - wl[a].z];
-    const len3 = (d) => Math.sqrt(d[0]**2 + d[1]**2 + d[2]**2);
-    const dot3 = (a, b) => a[0]*b[0] + a[1]*b[1] + a[2]*b[2];
-
-    // Bend angle at middle joint (3D, robust since it's relative)
+    // Bend angle at middle joint (2D)
     const bendAt = (a, b, c) => {
-        const v1 = d3(b, a), v2 = d3(b, c);
-        const l1 = len3(v1), l2 = len3(v2);
+        const v1 = d2(b, a), v2 = d2(b, c);
+        const l1 = len2(v1), l2 = len2(v2);
         if (l1 < 1e-6 || l2 < 1e-6) return 0;
-        const cos = clamp(dot3(v1, v2) / (l1 * l2), -1, 1);
+        const cos = clamp(dot2(v1, v2) / (l1 * l2), -1, 1);
         return clamp(180 - Math.acos(cos) * DEG, 0, 150);
     };
 
-    // === STRADDLE from 2D (most reliable) ===
-    // Angle of limb from vertical in the frontal plane (image plane)
-    // Person facing camera: person's left = image right
-    // Left limb going rightward = away from body = positive straddle
-    // Right limb going leftward = away from body = positive straddle
-    const [lAx, lAy] = d2(11, 13);  // left shoulder→elbow
-    const [rAx, rAy] = d2(12, 14);  // right shoulder→elbow
-    const [lLx, lLy] = d2(23, 25);  // left hip→knee
-    const [rLx, rLy] = d2(24, 26);  // right hip→knee
+    // === STRADDLE from 2D ===
+    // Angle of limb from vertical (positive = away from body)
+    // In image: x goes right, y goes down
+    // Person's left (COCO 5,7,9,11,13,15) appears on RIGHT side of image when facing camera
+    const [lAx, lAy] = d2(5, 7);   // left shoulder→elbow
+    const [rAx, rAy] = d2(6, 8);   // right shoulder→elbow
+    const [lLx, lLy] = d2(11, 13); // left hip→knee
+    const [rLx, rLy] = d2(12, 14); // right hip→knee
 
     const lArm_straddle = clamp(Math.atan2( lAx, lAy) * DEG, -90, 180);
     const rArm_straddle = clamp(Math.atan2(-rAx, rAy) * DEG, -90, 180);
     const lLeg_straddle = clamp(Math.atan2( lLx, lLy) * DEG, -60, 60);
     const rLeg_straddle = clamp(Math.atan2(-rLx, rLy) * DEG, -60, 60);
 
-    // === RAISE from 3D world landmarks (damped 70% due to z noise) ===
-    // Forward = -z in world landmarks (away from camera)
-    // Down = +y in world landmarks
-    const lA3 = d3(11, 13), rA3 = d3(12, 14);
-    const lL3 = d3(23, 25), rL3 = d3(24, 26);
-
-    const RAISE_DAMP = 0.7;
-    const lArm_raise = clamp(Math.atan2(-lA3[2], lA3[1]) * DEG * RAISE_DAMP, -90, 90);
-    const rArm_raise = clamp(Math.atan2(-rA3[2], rA3[1]) * DEG * RAISE_DAMP, -90, 90);
-    const lLeg_raise = clamp(Math.atan2(-lL3[2], lL3[1]) * DEG * RAISE_DAMP, -90, 90);
-    const rLeg_raise = clamp(Math.atan2(-rL3[2], rL3[1]) * DEG * RAISE_DAMP, -90, 90);
+    // === RAISE from apparent foreshortening ===
+    // Compare limb 2D length to expected length (based on shoulder width)
+    // If much shorter than expected, limb is pointing toward/away from camera
+    const shoulderW = len2(d2(5, 6));
+    function estimateRaise(from, to, expectedRatio) {
+        const limbLen = len2(d2(from, to));
+        const expected = shoulderW * expectedRatio;
+        if (expected < 1e-6) return 0;
+        const ratio = Math.min(limbLen / expected, 1.0);
+        if (ratio < 0.65) {
+            // Foreshortened → assume forward raise
+            return clamp(Math.acos(ratio) * DEG, 0, 90);
+        }
+        return 0;
+    }
+    // Typical proportions relative to shoulder width
+    const lArm_raise = estimateRaise(5, 7, 1.1);   // upper arm ≈ 1.1x shoulder width
+    const rArm_raise = estimateRaise(6, 8, 1.1);
+    const lLeg_raise = estimateRaise(11, 13, 1.4);  // thigh ≈ 1.4x shoulder width
+    const rLeg_raise = estimateRaise(12, 14, 1.4);
 
     // === TORSO ===
-    // Tilt from 2D (spine lean left/right)
-    const hipMid  = [(nl[23].x + nl[24].x) / 2, (nl[23].y + nl[24].y) / 2];
-    const shoMid  = [(nl[11].x + nl[12].x) / 2, (nl[11].y + nl[12].y) / 2];
+    const hipMid  = [(kp[11].x + kp[12].x) / 2, (kp[11].y + kp[12].y) / 2];
+    const shoMid  = [(kp[5].x + kp[6].x) / 2, (kp[5].y + kp[6].y) / 2];
     const spDx = shoMid[0] - hipMid[0], spDy = shoMid[1] - hipMid[1];
     const torso_tilt = clamp(Math.atan2(-spDx, -spDy) * DEG, -45, 45);
 
-    // Bend from 3D (forward lean, damped)
-    const hipMid3 = [(wl[23].y + wl[24].y) / 2, (wl[23].z + wl[24].z) / 2];
-    const shoMid3 = [(wl[11].y + wl[12].y) / 2, (wl[11].z + wl[12].z) / 2];
-    const spDy3 = shoMid3[0] - hipMid3[0]; // dy in world (down direction)
-    const spDz3 = shoMid3[1] - hipMid3[1]; // dz in world (toward camera)
-    const torso_bend = clamp(Math.atan2(-spDz3, -spDy3) * DEG * RAISE_DAMP, -45, 45);
+    // Torso bend from spine foreshortening
+    const spineLen = len2([spDx, spDy]);
+    const hipW = len2(d2(11, 12));
+    const expectedSpine = hipW * 2.0;
+    let torso_bend = 0;
+    if (expectedSpine > 1e-6) {
+        const ratio = Math.min(spineLen / expectedSpine, 1.0);
+        if (ratio < 0.7) {
+            torso_bend = clamp(Math.acos(ratio) * DEG, 0, 45);
+        }
+    }
 
     // === HEAD ===
-    // Tilt from 2D (ear-to-ear angle)
-    const [earDx, earDy] = d2(7, 8);
+    const [earDx, earDy] = d2(3, 4);
     const head_tilt = clamp(Math.atan2(earDy, earDx) * DEG, -30, 30);
 
-    // Turn from 2D (nose offset from ear midpoint, relative to ear distance)
-    const earMidX = (nl[7].x + nl[8].x) / 2;
-    const earDist = Math.max(Math.abs(nl[8].x - nl[7].x), 0.01);
-    const head_turn = clamp(((nl[0].x - earMidX) / earDist) * 60, -60, 60);
+    const earMidX = (kp[3].x + kp[4].x) / 2;
+    const earDist = Math.max(Math.abs(kp[4].x - kp[3].x), 0.01);
+    const head_turn = clamp(((kp[0].x - earMidX) / earDist) * 60, -60, 60);
 
-    // Nod: hard to get from 2D, use small damped 3D estimate
-    const head_nod = 0;
-
-    console.log('[AutoPose] 2D+3D hybrid:', {
+    console.log('[AutoPose] ViTPose COCO:', {
         lArm: { raise: lArm_raise, straddle: lArm_straddle },
         rArm: { raise: rArm_raise, straddle: rArm_straddle },
         lLeg: { raise: lLeg_raise, straddle: lLeg_straddle },
@@ -665,17 +697,17 @@ function landmarksToMannequinPose(nl, wl) {
     return {
         body:    { bend: 0, turn: -90, tilt: 0 },
         torso:   { bend: torso_bend, turn: 0, tilt: torso_tilt },
-        head:    { nod: head_nod, turn: head_turn, tilt: head_tilt },
+        head:    { nod: 0, turn: head_turn, tilt: head_tilt },
         l_arm:   { raise: lArm_raise, straddle: lArm_straddle, turn: 0 },
         r_arm:   { raise: rArm_raise, straddle: rArm_straddle, turn: 0 },
-        l_elbow: { bend: bendAt(11, 13, 15) },
-        r_elbow: { bend: bendAt(12, 14, 16) },
+        l_elbow: { bend: bendAt(5, 7, 9) },
+        r_elbow: { bend: bendAt(6, 8, 10) },
         l_wrist: { bend: 0, tilt: 0, turn: 0 },
         r_wrist: { bend: 0, tilt: 0, turn: 0 },
         l_leg:   { raise: lLeg_raise, straddle: lLeg_straddle, turn: 0 },
         r_leg:   { raise: rLeg_raise, straddle: rLeg_straddle, turn: 0 },
-        l_knee:  { bend: bendAt(23, 25, 27) },
-        r_knee:  { bend: bendAt(24, 26, 28) },
+        l_knee:  { bend: bendAt(11, 13, 15) },
+        r_knee:  { bend: bendAt(12, 14, 16) },
         l_ankle: { bend: 0, turn: 0, tilt: 0 },
         r_ankle: { bend: 0, turn: 0, tilt: 0 },
     };
