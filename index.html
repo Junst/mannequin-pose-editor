@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D Mannequin Pose Editor</title>
+    <link rel="stylesheet" href="style.css">
+    <script type="importmap">
+    {
+        "imports": {
+            "three": "https://cdn.jsdelivr.net/npm/three@0.169.0/build/three.module.js",
+            "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.169.0/examples/jsm/",
+            "mannequin": "https://cdn.jsdelivr.net/npm/mannequin-js@5.2.3/src/mannequin.js"
+        }
+    }
+    </script>
+</head>
+<body>
+    <div id="app">
+        <header>
+            <h1>3D Mannequin Pose Editor</h1>
+            <div id="character-select">
+                <button class="char-btn active" data-type="male">Male</button>
+                <button class="char-btn" data-type="female">Female</button>
+                <button class="char-btn" data-type="child">Child</button>
+            </div>
+        </header>
+        <div id="main">
+            <div id="viewport"></div>
+            <div id="sidebar">
+                <section id="joint-info">
+                    <h3>Selected: <span id="selected-name">None</span></h3>
+                    <div id="sliders"></div>
+                </section>
+                <section id="auto-pose">
+                    <h3>Auto Pose</h3>
+                    <div class="auto-pose-row">
+                        <button id="btn-auto-pose" class="auto-pose-btn">Upload Image</button>
+                        <span id="pose-detect-status"></span>
+                    </div>
+                    <input type="file" id="pose-image-input" accept="image/*" hidden>
+                </section>
+                <section id="body-parts">
+                    <h3>Body Parts</h3>
+                    <div id="part-buttons"></div>
+                </section>
+            </div>
+        </div>
+        <footer>
+            <div class="btn-group">
+                <button id="btn-png">&#x1F4F7; PNG</button>
+                <button id="btn-obj">&#x1F4E6; OBJ</button>
+                <button id="btn-gltf">&#x1F4E6; GLTF/GLB</button>
+            </div>
+            <div class="btn-group">
+                <button id="btn-depth-toggle" class="depth-btn">Depth: OFF</button>
+                <button id="btn-depth-png" class="depth-btn">&#x1F4F7; Depth PNG</button>
+            </div>
+            <div class="btn-group">
+                <button id="btn-normal-toggle" class="normal-btn">Normal: OFF</button>
+                <button id="btn-normal-png" class="normal-btn">&#x1F4F7; Normal PNG</button>
+            </div>
+            <div class="btn-group">
+                <button id="btn-save">&#x1F4BE; Save Pose</button>
+                <button id="btn-load">&#x1F4C2; Load Pose</button>
+                <button id="btn-reset">&#x1F504; Reset</button>
+            </div>
+            <input type="file" id="file-input" accept=".json" hidden>
+        </footer>
+    </div>
+    <script type="module" src="app.js"></script>
+</body>
+</html>
