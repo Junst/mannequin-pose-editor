@@ -512,6 +512,9 @@ async function processPoseImage(event) {
     // Draw debug skeleton overlay on viewport
     drawPoseDebug(img, result.landmarks[0]);
 
+    // Reset pose first so previous pose doesn't interfere
+    resetPose();
+
     // Use 2D normalized landmarks (reliable) + 3D world landmarks (for depth hints)
     const pose = landmarksToMannequinPose(result.landmarks[0], result.worldLandmarks[0]);
     applyPoseToMannequin(pose);
@@ -611,16 +614,17 @@ function landmarksToMannequinPose(nl, wl) {
     const lLeg_straddle = clamp(Math.atan2( lLx, lLy) * DEG, -60, 60);
     const rLeg_straddle = clamp(Math.atan2(-rLx, rLy) * DEG, -60, 60);
 
-    // === RAISE from 3D world landmarks (damped 50% due to z noise) ===
+    // === RAISE from 3D world landmarks (damped 70% due to z noise) ===
     // Forward = -z in world landmarks (away from camera)
     // Down = +y in world landmarks
     const lA3 = d3(11, 13), rA3 = d3(12, 14);
     const lL3 = d3(23, 25), rL3 = d3(24, 26);
 
-    const lArm_raise = clamp(Math.atan2(-lA3[2], lA3[1]) * DEG * 0.5, -90, 90);
-    const rArm_raise = clamp(Math.atan2(-rA3[2], rA3[1]) * DEG * 0.5, -90, 90);
-    const lLeg_raise = clamp(Math.atan2(-lL3[2], lL3[1]) * DEG * 0.5, -90, 90);
-    const rLeg_raise = clamp(Math.atan2(-rL3[2], rL3[1]) * DEG * 0.5, -90, 90);
+    const RAISE_DAMP = 0.7;
+    const lArm_raise = clamp(Math.atan2(-lA3[2], lA3[1]) * DEG * RAISE_DAMP, -90, 90);
+    const rArm_raise = clamp(Math.atan2(-rA3[2], rA3[1]) * DEG * RAISE_DAMP, -90, 90);
+    const lLeg_raise = clamp(Math.atan2(-lL3[2], lL3[1]) * DEG * RAISE_DAMP, -90, 90);
+    const rLeg_raise = clamp(Math.atan2(-rL3[2], rL3[1]) * DEG * RAISE_DAMP, -90, 90);
 
     // === TORSO ===
     // Tilt from 2D (spine lean left/right)
@@ -634,7 +638,7 @@ function landmarksToMannequinPose(nl, wl) {
     const shoMid3 = [(wl[11].y + wl[12].y) / 2, (wl[11].z + wl[12].z) / 2];
     const spDy3 = shoMid3[0] - hipMid3[0]; // dy in world (down direction)
     const spDz3 = shoMid3[1] - hipMid3[1]; // dz in world (toward camera)
-    const torso_bend = clamp(Math.atan2(-spDz3, -spDy3) * DEG * 0.5, -45, 45);
+    const torso_bend = clamp(Math.atan2(-spDz3, -spDy3) * DEG * RAISE_DAMP, -45, 45);
 
     // === HEAD ===
     // Tilt from 2D (ear-to-ear angle)
