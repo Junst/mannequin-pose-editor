@@ -481,7 +481,7 @@ async function processPoseImage(event) {
             );
             poseLandmarker = await PoseLandmarker.createFromOptions(resolver, {
                 baseOptions: {
-                    modelAssetPath: "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task",
+                    modelAssetPath: "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/1/pose_landmarker_full.task",
                     delegate: "GPU",
                 },
                 runningMode: "IMAGE",
@@ -519,70 +519,110 @@ async function processPoseImage(event) {
 }
 
 function landmarksToMannequinPose(wl) {
-    // MediaPipe world landmarks: x=person's left, y=down, z=toward camera
-    // Convert to: x=person's right, y=up, z=forward (away from camera)
-    const p = (i) => ({ x: -wl[i].x, y: -wl[i].y, z: -wl[i].z });
-    const sub = (a, b) => ({ x: a.x-b.x, y: a.y-b.y, z: a.z-b.z });
-    const mid = (a, b) => ({ x: (a.x+b.x)/2, y: (a.y+b.y)/2, z: (a.z+b.z)/2 });
-    const len = (v) => Math.sqrt(v.x*v.x + v.y*v.y + v.z*v.z);
-    const norm = (v) => { const l = len(v); return l > 1e-4 ? { x:v.x/l, y:v.y/l, z:v.z/l } : {x:0,y:0,z:0}; };
-    const dot = (a, b) => a.x*b.x + a.y*b.y + a.z*b.z;
-    const angle = (a, b) => Math.acos(Math.max(-1, Math.min(1, dot(norm(a), norm(b))))) * 180 / Math.PI;
-    const R = 180 / Math.PI;
+    // === Vector math helpers (array-based [x,y,z]) ===
+    const v  = (i) => [wl[i].x, wl[i].y, wl[i].z];
+    const sub = (a, b) => [a[0]-b[0], a[1]-b[1], a[2]-b[2]];
+    const add = (a, b) => [a[0]+b[0], a[1]+b[1], a[2]+b[2]];
+    const sc  = (a, s) => [a[0]*s, a[1]*s, a[2]*s];
+    const dot = (a, b) => a[0]*b[0] + a[1]*b[1] + a[2]*b[2];
+    const cross = (a, b) => [a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]];
+    const len = (a) => Math.sqrt(dot(a, a));
+    const norm = (a) => { const l = len(a); return l > 1e-6 ? sc(a, 1/l) : [0,0,0]; };
+    const mid = (a, b) => sc(add(a, b), 0.5);
+    const clamp = (val, lo, hi) => Math.max(lo, Math.min(hi, val));
+    const DEG = 180 / Math.PI;
 
-    const lS = p(11), rS = p(12), lE = p(13), rE = p(14), lW = p(15), rW = p(16);
-    const lH = p(23), rH = p(24), lK = p(25), rK = p(26), lA = p(27), rA = p(28);
-    const nose = p(0), lEar = p(7), rEar = p(8);
+    // === Landmarks ===
+    const lS = v(11), rS = v(12);   // shoulders
+    const lE = v(13), rE = v(14);   // elbows
+    const lW = v(15), rW = v(16);   // wrists
+    const lH = v(23), rH = v(24);   // hips
+    const lK = v(25), rK = v(26);   // knees
+    const lA = v(27), rA = v(28);   // ankles
+    const nose = v(0), lEar = v(7), rEar = v(8);
 
-    // Bone vectors
-    const lUA = sub(lE, lS), rUA = sub(rE, rS);
-    const lFA = sub(lW, lE), rFA = sub(rW, rE);
-    const lUL = sub(lK, lH), rUL = sub(rK, rH);
-    const lLL = sub(lA, lK), rLL = sub(rA, rK);
-    const spine = sub(mid(lS, rS), mid(lH, rH));
+    // === Body-local coordinate frame ===
+    // MediaPipe: x=person's left, y=down, z=toward camera
+    const hipCenter = mid(lH, rH);
+    const shoulderCenter = mid(lS, rS);
+    const spineVec = sub(shoulderCenter, hipCenter);  // hip → shoulder = body "up"
 
-    // Torso
-    const torso_bend = Math.atan2(spine.z, spine.y) * R;
-    const torso_tilt = Math.atan2(-spine.x, spine.y) * R;
+    const bodyUp = norm(spineVec);
+    const rawRight = norm(sub(rH, lH));  // person's left→right = body "right"
+    // Orthogonalize right against up
+    const bodyRight = norm(sub(rawRight, sc(bodyUp, dot(rawRight, bodyUp))));
+    const bodyFwd = cross(bodyRight, bodyUp);  // forward direction
 
-    // Arms: raise=fwd/back in YZ plane, straddle=sideways in XY plane
-    // Down=(0,-1,0), so rest arm → atan2(0,1)=0
-    const l_arm_raise    = Math.atan2(lUA.z, -lUA.y) * R;
-    const l_arm_straddle = Math.atan2(-lUA.x, -lUA.y) * R;
-    const r_arm_raise    = Math.atan2(rUA.z, -rUA.y) * R;
-    const r_arm_straddle = Math.atan2(rUA.x, -rUA.y) * R;
+    // Project a world vector into body-local frame → [right, up, forward]
+    const toLocal = (vec) => [dot(vec, bodyRight), dot(vec, bodyUp), dot(vec, bodyFwd)];
 
-    const l_elbow_bend = Math.max(0, 180 - angle(lUA, lFA));
-    const r_elbow_bend = Math.max(0, 180 - angle(rUA, rFA));
+    // === Limb angle computation ===
+    // Rest position: bone points "down" = [0, -1, 0] in body-local frame
+    // raise:    swing in up-forward plane  = atan2(forward, -up)
+    // straddle: swing sideways             = atan2(±right, -up)
+    function limbAngles(from, to, isLeft) {
+        const bl = toLocal(norm(sub(to, from)));
+        const raise = Math.atan2(bl[2], -bl[1]) * DEG;
+        const straddle = isLeft
+            ? Math.atan2(-bl[0], -bl[1]) * DEG   // left: away = -right
+            : Math.atan2( bl[0], -bl[1]) * DEG;  // right: away = +right
+        return {
+            raise:    clamp(raise, -120, 120),
+            straddle: clamp(straddle, -120, 120),
+        };
+    }
 
-    // Legs
-    const l_leg_raise    = Math.atan2(lUL.z, -lUL.y) * R;
-    const l_leg_straddle = Math.atan2(-lUL.x, -lUL.y) * R;
-    const r_leg_raise    = Math.atan2(rUL.z, -rUL.y) * R;
-    const r_leg_straddle = Math.atan2(rUL.x, -rUL.y) * R;
+    // Bend angle at middle joint (coordinate-system independent)
+    function bendAngle(a, b, c) {
+        const v1 = norm(sub(b, a));
+        const v2 = norm(sub(c, b));
+        return clamp(180 - Math.acos(clamp(dot(v1, v2), -1, 1)) * DEG, 0, 150);
+    }
 
-    const l_knee_bend = Math.max(0, 180 - angle(lUL, lLL));
-    const r_knee_bend = Math.max(0, 180 - angle(rUL, rLL));
+    // === Compute all joint angles ===
+    const lArm = limbAngles(lS, lE, true);
+    const rArm = limbAngles(rS, rE, false);
+    const lLeg = limbAngles(lH, lK, true);
+    const rLeg = limbAngles(rH, rK, false);
 
-    // Head
-    const hc = mid(lEar, rEar);
-    const hd = sub(nose, hc);
-    const ear = sub(rEar, lEar);
+    // Torso: spine deviation from vertical [0,-1,0] in MediaPipe space
+    const sn = norm(spineVec);
+    const torso_bend = clamp(Math.atan2(
+        dot(sn, [0, 0, 1]),    // forward component (z)
+        -dot(sn, [0, 1, 0])    // upward component (-y)
+    ) * DEG, -60, 60);
+    const torso_tilt = clamp(Math.atan2(
+        -dot(sn, [1, 0, 0]),   // rightward component (-x)
+        -dot(sn, [0, 1, 0])
+    ) * DEG, -60, 60);
+
+    // Head: orientation relative to body frame
+    const headDir = norm(sub(nose, mid(lEar, rEar)));
+    const earAxis = norm(sub(rEar, lEar));
+    const hdL = toLocal(headDir);
+    const eaL = toLocal(earAxis);
+
+    const head_nod  = clamp(Math.atan2(-hdL[1], hdL[2]) * DEG, -45, 45);
+    const head_turn = clamp(Math.atan2(-eaL[2], eaL[0]) * DEG, -60, 60);
+    const head_tilt = clamp(Math.atan2( eaL[1], eaL[0]) * DEG, -45, 45);
+
+    console.log('[AutoPose] arms:', lArm, rArm, 'legs:', lLeg, rLeg,
+        'torso:', { bend: torso_bend, tilt: torso_tilt });
 
     return {
         body:    { bend: 0, turn: 0, tilt: 0 },
         torso:   { bend: torso_bend, turn: 0, tilt: torso_tilt },
-        head:    { nod: Math.atan2(-hd.y, hd.z)*R, turn: Math.atan2(-ear.z, ear.x)*R, tilt: Math.atan2(ear.y, ear.x)*R },
-        l_arm:   { raise: l_arm_raise, straddle: l_arm_straddle, turn: 0 },
-        r_arm:   { raise: r_arm_raise, straddle: r_arm_straddle, turn: 0 },
-        l_elbow: { bend: l_elbow_bend },
-        r_elbow: { bend: r_elbow_bend },
+        head:    { nod: head_nod, turn: head_turn, tilt: head_tilt },
+        l_arm:   { raise: lArm.raise, straddle: lArm.straddle, turn: 0 },
+        r_arm:   { raise: rArm.raise, straddle: rArm.straddle, turn: 0 },
+        l_elbow: { bend: bendAngle(lS, lE, lW) },
+        r_elbow: { bend: bendAngle(rS, rE, rW) },
         l_wrist: { bend: 0, tilt: 0, turn: 0 },
         r_wrist: { bend: 0, tilt: 0, turn: 0 },
-        l_leg:   { raise: l_leg_raise, straddle: l_leg_straddle, turn: 0 },
-        r_leg:   { raise: r_leg_raise, straddle: r_leg_straddle, turn: 0 },
-        l_knee:  { bend: l_knee_bend },
-        r_knee:  { bend: r_knee_bend },
+        l_leg:   { raise: lLeg.raise, straddle: lLeg.straddle, turn: 0 },
+        r_leg:   { raise: rLeg.raise, straddle: rLeg.straddle, turn: 0 },
+        l_knee:  { bend: bendAngle(lH, lK, lA) },
+        r_knee:  { bend: bendAngle(rH, rK, rA) },
         l_ankle: { bend: 0, turn: 0, tilt: 0 },
         r_ankle: { bend: 0, turn: 0, tilt: 0 },
     };
