@@ -33,6 +33,29 @@ let depthMaterial = null;
 let normalMaterial = null;
 let savedBackground = null;
 
+// Viewport interaction state
+let interactionMode = 'camera'; // 'camera' or 'pose'
+const raycaster = new THREE.Raycaster();
+const mouse = new THREE.Vector2();
+let isDragging = false;
+let dragStart = { x: 0, y: 0 };
+let dragPartInfo = null; // { part, axes } of the part being dragged
+let highlightedMeshes = []; // meshes with saved original materials
+const DRAG_SENSITIVITY = 0.7; // degrees per pixel
+
+// Gizmo state
+const GIZMO_RADIUS = 0.08;
+const GIZMO_TUBE = 0.008;
+const GIZMO_COLORS = [0xff4444, 0x44cc44, 0x4488ff];
+let gizmoGroup = null;
+let gizmoRings = [];       // [{ mesh, axisName }]
+let gizmoDragging = false;
+let gizmoDragAxisName = null;
+let gizmoDragPart = null;
+let gizmoDragStartAngle = 0;
+let gizmoScreenCenter = { x: 0, y: 0 };
+let gizmoControlsDisabled = false;
+
 // ── Initialization ──────────────────────────────────────────────────────────
 
 function init() {
@@ -46,9 +69,10 @@ function init() {
     canvas.style.cssText = '';
     viewport.appendChild(canvas);
 
-    // Update depth uniforms every frame when depth mode is active
+    // Per-frame updates
     stage.animationLoop = () => {
         if (depthMode) updateDepthUniforms();
+        updateGizmoPosition();
     };
 
     // Create default male figure
@@ -59,6 +83,12 @@ function init() {
 
     // Wire up all UI event listeners
     setupEventListeners();
+
+    // Set up viewport click/drag interaction
+    setupViewportInteraction();
+
+    // Create gizmo (initially hidden)
+    createGizmo();
 
     // Fit renderer to viewport container
     handleResize();
@@ -104,6 +134,13 @@ function selectPart(name) {
 
     document.getElementById('selected-name').textContent = name;
     buildSliders(name);
+
+    // Update 3D highlight
+    clearHighlight();
+    highlightPart(name);
+
+    // Update gizmo if in gizmo mode
+    if (interactionMode === 'gizmo') showGizmo(name);
 }
 
 // ── Joint Sliders ───────────────────────────────────────────────────────────
@@ -174,9 +211,13 @@ function switchCharacter(type) {
         default:       figure = new Male();   break;
     }
 
-    // Refresh sliders for currently selected part
+    // Reset highlight/gizmo and refresh sliders for currently selected part
+    clearHighlight();
+    hideGizmo();
     if (selectedPartName) {
         buildSliders(selectedPartName);
+        highlightPart(selectedPartName);
+        if (interactionMode === 'gizmo') showGizmo(selectedPartName);
     }
 }
 
@@ -732,6 +773,409 @@ function downloadBlob(blob, filename) {
     link.download = filename;
     link.click();
     URL.revokeObjectURL(url);
+}
+
+// ── Viewport Interaction (Click Select + Drag Rotate) ───────────────────────
+
+function setupViewportInteraction() {
+    const canvas = stage.renderer.domElement;
+
+    canvas.addEventListener('mousedown', onViewportMouseDown);
+    window.addEventListener('mousemove', onViewportMouseMove);
+    window.addEventListener('mouseup', onViewportMouseUp);
+
+    // Mode toggle button
+    document.getElementById('btn-mode-toggle').addEventListener('click', toggleInteractionMode);
+
+    // Q key shortcut
+    document.addEventListener('keydown', (e) => {
+        if (e.key === 'q' || e.key === 'Q') {
+            // Ignore if typing in an input
+            if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+            toggleInteractionMode();
+        }
+    });
+}
+
+function toggleInteractionMode() {
+    const btn = document.getElementById('btn-mode-toggle');
+    const viewport = document.getElementById('viewport');
+
+    // Cancel any active drag
+    isDragging = false;
+    dragPartInfo = null;
+    gizmoDragging = false;
+    gizmoDragPart = null;
+    if (stage.controls) stage.controls.enabled = true;
+
+    // Cycle: camera → pose → gizmo → camera
+    if (interactionMode === 'camera') {
+        interactionMode = 'pose';
+        btn.textContent = 'Mode: Drag';
+        btn.className = 'pose-mode';
+        viewport.classList.remove('gizmo-mode');
+        viewport.classList.add('pose-mode');
+        hideGizmo();
+    } else if (interactionMode === 'pose') {
+        interactionMode = 'gizmo';
+        btn.textContent = 'Mode: Gizmo';
+        btn.className = 'gizmo-mode';
+        viewport.classList.remove('pose-mode');
+        viewport.classList.add('gizmo-mode');
+        if (selectedPartName) showGizmo(selectedPartName);
+    } else {
+        interactionMode = 'camera';
+        btn.textContent = 'Mode: Camera';
+        btn.className = '';
+        viewport.classList.remove('pose-mode', 'gizmo-mode');
+        hideGizmo();
+    }
+    updateGizmoLegend();
+}
+
+function getMouseNDC(event) {
+    const canvas = stage.renderer.domElement;
+    const rect = canvas.getBoundingClientRect();
+    mouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+    mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+    return mouse;
+}
+
+function findBodyPart(intersectedObject) {
+    // Walk up the parent chain and try to match against figure[prop]
+    let obj = intersectedObject;
+    while (obj) {
+        for (const [name, info] of Object.entries(BODY_PARTS)) {
+            try {
+                if (figure[info.prop] === obj) return name;
+            } catch (_) { /* ignore */ }
+        }
+        obj = obj.parent;
+    }
+    return null;
+}
+
+function onViewportMouseDown(event) {
+    if (event.button !== 0) return; // left button only
+
+    // ── Gizmo mode ──
+    if (interactionMode === 'gizmo') {
+        const ndc = getMouseNDC(event);
+        raycaster.setFromCamera(ndc, stage.camera);
+
+        // First: check gizmo rings
+        if (gizmoGroup && gizmoGroup.visible && gizmoRings.length > 0) {
+            const ringMeshes = gizmoRings.map(r => r.mesh);
+            const gizmoHits = raycaster.intersectObjects(ringMeshes, false);
+            if (gizmoHits.length > 0) {
+                const hitRing = gizmoHits[0].object;
+                gizmoDragging = true;
+                gizmoDragAxisName = hitRing.userData.axisName;
+                const info = BODY_PARTS[selectedPartName];
+                gizmoDragPart = figure[info.prop];
+                // Screen center for angular drag
+                gizmoScreenCenter = getScreenPos(gizmoGroup.position);
+                gizmoDragStartAngle = Math.atan2(
+                    event.clientY - gizmoScreenCenter.y,
+                    event.clientX - gizmoScreenCenter.x
+                );
+                // Highlight active ring
+                hitRing.material.opacity = 0.95;
+                // Disable OrbitControls
+                if (stage.controls) stage.controls.enabled = false;
+                gizmoControlsDisabled = true;
+                document.getElementById('viewport').classList.add('dragging-gizmo');
+                return;
+            }
+        }
+
+        // Second: check mannequin for part selection
+        const meshes = [];
+        if (figure) figure.traverse(c => { if (c.isMesh) meshes.push(c); });
+        const intersects = raycaster.intersectObjects(meshes, false);
+        if (intersects.length > 0) {
+            const partName = findBodyPart(intersects[0].object);
+            if (partName) {
+                selectPart(partName);
+                if (stage.controls) stage.controls.enabled = false;
+                gizmoControlsDisabled = true;
+            }
+        }
+        return;
+    }
+
+    // ── Pose mode ──
+    if (interactionMode !== 'pose') return;
+
+    const ndc = getMouseNDC(event);
+    raycaster.setFromCamera(ndc, stage.camera);
+
+    const meshes = [];
+    if (figure) {
+        figure.traverse((child) => {
+            if (child.isMesh) meshes.push(child);
+        });
+    }
+
+    const intersects = raycaster.intersectObjects(meshes, false);
+    if (intersects.length > 0) {
+        const partName = findBodyPart(intersects[0].object);
+        if (partName) {
+            selectPart(partName);
+
+            // Begin drag
+            isDragging = true;
+            dragStart.x = event.clientX;
+            dragStart.y = event.clientY;
+            const info = BODY_PARTS[partName];
+            dragPartInfo = { part: figure[info.prop], axes: info.axes };
+
+            // Disable OrbitControls during drag
+            if (stage.controls) stage.controls.enabled = false;
+
+            const viewport = document.getElementById('viewport');
+            viewport.classList.add('dragging');
+        }
+    }
+}
+
+function onViewportMouseMove(event) {
+    // ── Gizmo drag ──
+    if (gizmoDragging && gizmoDragPart && gizmoDragAxisName) {
+        const newAngle = Math.atan2(
+            event.clientY - gizmoScreenCenter.y,
+            event.clientX - gizmoScreenCenter.x
+        );
+        let delta = newAngle - gizmoDragStartAngle;
+        if (delta > Math.PI) delta -= 2 * Math.PI;
+        if (delta < -Math.PI) delta += 2 * Math.PI;
+        const deltaDeg = delta * (180 / Math.PI);
+        try {
+            const current = gizmoDragPart[gizmoDragAxisName] || 0;
+            gizmoDragPart[gizmoDragAxisName] = clampAngle(current + deltaDeg);
+        } catch (_) {}
+        gizmoDragStartAngle = newAngle;
+        if (selectedPartName) buildSliders(selectedPartName);
+        return;
+    }
+
+    // ── Gizmo hover highlight ──
+    if (interactionMode === 'gizmo' && !gizmoDragging && gizmoGroup && gizmoGroup.visible) {
+        const ndc = getMouseNDC(event);
+        raycaster.setFromCamera(ndc, stage.camera);
+        const ringMeshes = gizmoRings.map(r => r.mesh);
+        const hits = raycaster.intersectObjects(ringMeshes, false);
+        for (const r of gizmoRings) r.mesh.material.opacity = 0.5;
+        if (hits.length > 0) {
+            hits[0].object.material.opacity = 0.85;
+            stage.renderer.domElement.style.cursor = 'grab';
+        } else {
+            stage.renderer.domElement.style.cursor = '';
+        }
+        return;
+    }
+
+    // ── Pose drag ──
+    if (!isDragging || !dragPartInfo) return;
+
+    const { part, axes } = dragPartInfo;
+    const shiftHeld = event.shiftKey;
+
+    try {
+        if (shiftHeld && axes.length >= 3) {
+            const delta = (event.clientX - dragStart.x) * DRAG_SENSITIVITY;
+            const current = part[axes[2]] || 0;
+            part[axes[2]] = clampAngle(current + delta);
+        } else {
+            if (axes.length >= 1) {
+                const deltaX = (event.clientX - dragStart.x) * DRAG_SENSITIVITY;
+                const currentX = part[axes[0]] || 0;
+                part[axes[0]] = clampAngle(currentX + deltaX);
+            }
+            if (axes.length >= 2) {
+                const deltaY = (event.clientY - dragStart.y) * DRAG_SENSITIVITY;
+                const currentY = part[axes[1]] || 0;
+                part[axes[1]] = clampAngle(currentY - deltaY);
+            }
+        }
+    } catch (_) { /* ignore unsupported axes */ }
+
+    dragStart.x = event.clientX;
+    dragStart.y = event.clientY;
+
+    if (selectedPartName) buildSliders(selectedPartName);
+}
+
+function onViewportMouseUp() {
+    // ── Gizmo cleanup ──
+    if (gizmoDragging) {
+        gizmoDragging = false;
+        gizmoDragAxisName = null;
+        gizmoDragPart = null;
+        for (const r of gizmoRings) r.mesh.material.opacity = 0.5;
+        document.getElementById('viewport').classList.remove('dragging-gizmo');
+    }
+    if (gizmoControlsDisabled) {
+        if (stage.controls) stage.controls.enabled = true;
+        gizmoControlsDisabled = false;
+    }
+
+    // ── Pose cleanup ──
+    if (!isDragging) return;
+    isDragging = false;
+    dragPartInfo = null;
+    if (stage.controls) stage.controls.enabled = true;
+    document.getElementById('viewport').classList.remove('dragging');
+}
+
+function clampAngle(value) {
+    return Math.max(-180, Math.min(180, value));
+}
+
+// ── Gizmo System (Rotation Rings) ───────────────────────────────────────────
+
+function createGizmo() {
+    gizmoGroup = new THREE.Group();
+    gizmoGroup.visible = false;
+    stage.scene.add(gizmoGroup);
+}
+
+function showGizmo(partName) {
+    // Clear old rings
+    for (const r of gizmoRings) {
+        gizmoGroup.remove(r.mesh);
+        r.mesh.geometry.dispose();
+        r.mesh.material.dispose();
+    }
+    gizmoRings = [];
+
+    if (!partName || !figure) { gizmoGroup.visible = false; updateGizmoLegend(); return; }
+
+    const info = BODY_PARTS[partName];
+    if (!info) { gizmoGroup.visible = false; updateGizmoLegend(); return; }
+
+    const part = figure[info.prop];
+    if (!part) { gizmoGroup.visible = false; updateGizmoLegend(); return; }
+
+    // Position at part's world position
+    const worldPos = new THREE.Vector3();
+    part.getWorldPosition(worldPos);
+    gizmoGroup.position.copy(worldPos);
+
+    // Create a ring for each axis
+    for (let i = 0; i < info.axes.length && i < 3; i++) {
+        const geom = new THREE.TorusGeometry(GIZMO_RADIUS, GIZMO_TUBE, 16, 64);
+        const mat = new THREE.MeshBasicMaterial({
+            color: GIZMO_COLORS[i],
+            transparent: true,
+            opacity: 0.5,
+            depthTest: false,
+            side: THREE.DoubleSide,
+        });
+        const ring = new THREE.Mesh(geom, mat);
+        ring.renderOrder = 999;
+        ring.userData = { axisIndex: i, axisName: info.axes[i] };
+
+        // Orient each ring to a different plane
+        if (i === 0) ring.rotation.y = Math.PI / 2;      // YZ plane
+        else if (i === 1) ring.rotation.x = Math.PI / 2;  // XZ plane
+        // i === 2: XY plane (default)
+
+        gizmoGroup.add(ring);
+        gizmoRings.push({ mesh: ring, axisName: info.axes[i] });
+    }
+
+    gizmoGroup.visible = true;
+    updateGizmoLegend();
+}
+
+function hideGizmo() {
+    if (!gizmoGroup) return;
+    for (const r of gizmoRings) {
+        gizmoGroup.remove(r.mesh);
+        r.mesh.geometry.dispose();
+        r.mesh.material.dispose();
+    }
+    gizmoRings = [];
+    gizmoGroup.visible = false;
+    updateGizmoLegend();
+}
+
+function updateGizmoPosition() {
+    if (!gizmoGroup || !gizmoGroup.visible || !selectedPartName) return;
+    const info = BODY_PARTS[selectedPartName];
+    if (!info || !figure) return;
+    const part = figure[info.prop];
+    if (!part) return;
+    const worldPos = new THREE.Vector3();
+    part.getWorldPosition(worldPos);
+    gizmoGroup.position.copy(worldPos);
+}
+
+function getScreenPos(worldPos) {
+    const v = worldPos.clone().project(stage.camera);
+    const canvas = stage.renderer.domElement;
+    const rect = canvas.getBoundingClientRect();
+    return {
+        x: (v.x * 0.5 + 0.5) * rect.width + rect.left,
+        y: (-v.y * 0.5 + 0.5) * rect.height + rect.top,
+    };
+}
+
+function updateGizmoLegend() {
+    let legend = document.getElementById('gizmo-legend');
+
+    if (interactionMode !== 'gizmo' || !selectedPartName || gizmoRings.length === 0) {
+        if (legend) legend.style.display = 'none';
+        return;
+    }
+
+    const info = BODY_PARTS[selectedPartName];
+    if (!info) return;
+
+    if (!legend) {
+        legend = document.createElement('div');
+        legend.id = 'gizmo-legend';
+        document.getElementById('viewport').appendChild(legend);
+    }
+
+    const colors = ['#ff4444', '#44cc44', '#4488ff'];
+    legend.innerHTML = info.axes.map((axis, i) =>
+        `<span style="color:${colors[i]}">&#9679; ${axis}</span>`
+    ).join('');
+    legend.style.display = 'flex';
+}
+
+// ── Highlight System ────────────────────────────────────────────────────────
+
+const highlightMaterial = new THREE.MeshPhongMaterial({
+    color: 0xe94560,
+    emissive: 0xe94560,
+    emissiveIntensity: 0.3,
+    transparent: true,
+    opacity: 0.7,
+});
+
+function highlightPart(name) {
+    const info = BODY_PARTS[name];
+    if (!info || !figure) return;
+
+    const part = figure[info.prop];
+    if (!part) return;
+
+    part.traverse((child) => {
+        if (child.isMesh) {
+            highlightedMeshes.push({ mesh: child, originalMaterial: child.material });
+            child.material = highlightMaterial;
+        }
+    });
+}
+
+function clearHighlight() {
+    for (const { mesh, originalMaterial } of highlightedMeshes) {
+        if (mesh) mesh.material = originalMaterial;
+    }
+    highlightedMeshes = [];
 }
 
 // ── Event Wiring ────────────────────────────────────────────────────────────
