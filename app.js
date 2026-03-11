@@ -47,6 +47,7 @@ const DRAG_SENSITIVITY = 0.7; // degrees per pixel
 const GIZMO_RADIUS = 0.08;
 const GIZMO_TUBE = 0.008;
 const GIZMO_COLORS = [0xff4444, 0x44cc44, 0x4488ff];
+let gizmoScene = null;
 let gizmoGroup = null;
 let gizmoRings = [];       // [{ mesh, axisName }]
 let gizmoDragging = false;
@@ -87,8 +88,20 @@ function init() {
     // Set up viewport click/drag interaction
     setupViewportInteraction();
 
-    // Create gizmo (initially hidden)
+    // Create gizmo (initially hidden, in separate scene)
     createGizmo();
+
+    // Render gizmo in a separate pass so overrideMaterial doesn't affect it
+    const origRender = stage.renderer.render.bind(stage.renderer);
+    stage.renderer.render = function(scene, camera) {
+        origRender(scene, camera);
+        if (gizmoGroup && gizmoGroup.visible) {
+            const prev = stage.renderer.autoClear;
+            stage.renderer.autoClear = false;
+            origRender(gizmoScene, camera);
+            stage.renderer.autoClear = prev;
+        }
+    };
 
     // Fit renderer to viewport container
     handleResize();
@@ -1035,9 +1048,10 @@ function clampAngle(value) {
 // ── Gizmo System (Rotation Rings) ───────────────────────────────────────────
 
 function createGizmo() {
+    gizmoScene = new THREE.Scene();
     gizmoGroup = new THREE.Group();
     gizmoGroup.visible = false;
-    stage.scene.add(gizmoGroup);
+    gizmoScene.add(gizmoGroup);
 }
 
 function showGizmo(partName) {
